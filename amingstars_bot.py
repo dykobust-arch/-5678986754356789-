@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# REFERRAL TELEGRAM BOT — FULL FIX
+# REFERRAL TELEGRAM BOT — с обязательной подпиской через Tgrass при /start
 
 import logging
 import sqlite3
@@ -22,7 +22,6 @@ ADMIN_USERNAME      = "famelonov"
 CHANNEL_LINK        = "https://t.me/REF_GO_PAY"
 REWARD_PER_REFERRAL = 2
 MIN_WITHDRAWAL      = 15
-TASK_REWARD         = 3
 
 TGRASS_URL  = "https://tgrass.space/offers"
 TGRASS_AUTH = "aca6f2a2ad034cf5af45277689c2fa1e"
@@ -55,7 +54,6 @@ def init_db():
                 balance      REAL    DEFAULT 0,
                 total_earned REAL    DEFAULT 0,
                 ref_count    INTEGER DEFAULT 0,
-                tasks_done   INTEGER DEFAULT 0,
                 joined_at    TEXT    DEFAULT (datetime('now','localtime'))
             );
             CREATE TABLE IF NOT EXISTS withdrawals (
@@ -73,12 +71,6 @@ def init_db():
             );
             INSERT OR IGNORE INTO stats VALUES (1, 0);
         """)
-        # Миграция для старых БД
-        try:
-            c.execute("ALTER TABLE users ADD COLUMN tasks_done INTEGER DEFAULT 0")
-            log.info("Миграция: добавлена колонка tasks_done")
-        except Exception:
-            pass
 
 
 def get_user(uid):
@@ -110,8 +102,8 @@ def register_user(uid, username, full_name, referrer_id=None):
 
 MAIN_KB = ReplyKeyboardMarkup(
     [
-        [KeyboardButton("💰 Заработать"), KeyboardButton("📋 Задания")],
-        [KeyboardButton("👤 Кабинет"),    KeyboardButton("ℹ️ О боте")],
+        [KeyboardButton("💰 Заработать"), KeyboardButton("👤 Кабинет")],
+        [KeyboardButton("ℹ️ О боте")],
     ],
     resize_keyboard=True,
 )
@@ -122,32 +114,67 @@ CANCEL_KB = ReplyKeyboardMarkup(
 )
 
 
-# ── /start ───────────────────────────────────────────────────
+# ── TGRASS ───────────────────────────────────────────────────
 
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    args = ctx.args or []
-    referrer_id = None
-
-    if args:
+async def _tgrass_get_offers(user):
+    """Запрос к tgrass /offers. Возвращает (status_code, data | None)."""
+    payload = {
+        "tg_user_id": int(user.id),
+        "tg_login":   user.username or "",
+        "lang":       getattr(user, "language_code", "ru") or "ru",
+        "is_premium": bool(getattr(user, "is_premium", False)),
+    }
+    log.info(f"tgrass /offers request [{user.id}]: {payload}")
+    try:
+        async with httpx.AsyncClient(verify=False, timeout=15.0) as client:
+            resp = await client.post(
+                TGRASS_URL,
+                json=payload,
+                headers={
+                    "accept":       "application/json",
+                    "Content-Type": "application/json",
+                    "Auth":         TGRASS_AUTH,
+                },
+            )
+        log.info(f"tgrass /offers response [{user.id}]: HTTP {resp.status_code} | {resp.text[:300]}")
         try:
-            ref = int(str(args[0]).replace("ref_", ""))
-            if ref != u.id and get_user(ref):
-                referrer_id = ref
-        except (ValueError, TypeError):
-            pass
+            data = resp.json()
+        except Exception:
+            data = None
+        return resp.status_code, data
+    except httpx.TimeoutException:
+        log.warning(f"tgrass timeout [{user.id}]")
+        return None, None
+    except Exception as e:
+        log.warning(f"tgrass exception [{user.id}]: {e}")
+        return None, None
 
-    is_new = register_user(u.id, u.username, u.full_name, referrer_id)
+
+def _build_offers_kb(offers: list, callback_data: str = "tgrass_check_start") -> InlineKeyboardMarkup:
+    """Строит клавиатуру из офферов + кнопку проверки."""
+    kb = []
+    for offer in offers:
+        btn_text = "Подписаться" if offer.get("type") == "channel" else "Перейти"
+        link = offer.get("link") or offer.get("url", "")
+        if link:
+            kb.append([InlineKeyboardButton(text=btn_text, url=link)])
+    kb.append([InlineKeyboardButton(text="✅ Я подписался — проверить", callback_data=callback_data)])
+    return InlineKeyboardMarkup(kb)
+
+
+async def _finish_start(bot, user, referrer_id: int | None):
+    """Регистрирует пользователя и отправляет приветствие с главным меню."""
+    is_new = register_user(user.id, user.username, user.full_name, referrer_id)
 
     if is_new and referrer_id:
         referrer = get_user(referrer_id)
         if referrer:
             try:
-                await ctx.bot.send_message(
+                await bot.send_message(
                     chat_id=referrer_id,
                     text=(
                         f"🎉 По вашей реферальной ссылке зарегистрировался новый пользователь!\n\n"
-                        f"👤 {u.full_name}\n"
+                        f"👤 {user.full_name}\n"
                         f"💰 Начислено: +{REWARD_PER_REFERRAL}₽\n"
                         f"💵 Баланс: {referrer['balance'] + REWARD_PER_REFERRAL:.0f}₽"
                     ),
@@ -156,12 +183,103 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 log.warning(f"Не удалось уведомить реферера {referrer_id}: {e}")
 
     label = "С возвращением" if not is_new else "Добро пожаловать"
-    await update.message.reply_text(
-        f"👋 {label}, {u.first_name}!\n\n"
-        f"🤑 Приглашай друзей и получай {REWARD_PER_REFERRAL}₽ за каждого!\n\n"
-        f"Выбери действие 👇",
+    await bot.send_message(
+        chat_id=user.id,
+        text=(
+            f"👋 {label}, {user.first_name}!\n\n"
+            f"🤑 Приглашай друзей и получай {REWARD_PER_REFERRAL}₽ за каждого!\n\n"
+            f"Выбери действие 👇"
+        ),
         reply_markup=MAIN_KB,
     )
+
+
+# ── /start ───────────────────────────────────────────────────
+
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    args = ctx.args or []
+
+    # Парсим реферальный аргумент и сохраняем в контекст
+    referrer_id = None
+    if args:
+        try:
+            ref = int(str(args[0]).replace("ref_", ""))
+            if ref != u.id and get_user(ref):
+                referrer_id = ref
+        except (ValueError, TypeError):
+            pass
+    ctx.user_data["pending_referrer_id"] = referrer_id
+
+    # Всегда проверяем tgrass — и для новых, и для существующих пользователей
+    is_existing = bool(get_user(u.id))
+    await update.message.reply_text("⏳ Проверяю доступ...")
+    status_code, data = await _tgrass_get_offers(u)
+
+    tg_status = data.get("status") if isinstance(data, dict) else None
+    offers    = data.get("offers", []) if isinstance(data, dict) else []
+
+    # Есть невыполненные офферы — блокируем до подписки
+    if status_code == 200 and tg_status == "not_ok" and offers:
+        text = (
+            "📋 Появились новые задания! Подпишитесь на партнёров чтобы продолжить:\n\n"
+            "После подписки нажмите кнопку ниже 👇"
+        ) if is_existing else (
+            "📋 Для начала работы подпишитесь на наших партнёров:\n\n"
+            "После подписки нажмите кнопку ниже 👇"
+        )
+        await update.message.reply_text(
+            text,
+            reply_markup=_build_offers_kb(offers, callback_data="tgrass_check_start"),
+        )
+        return
+
+    # Офферов нет, все выполнены или ошибка — регистрируем/пропускаем в меню
+    await _finish_start(ctx.bot, u, referrer_id)
+
+
+# ── Проверка подписки при старте ─────────────────────────────
+
+async def tgrass_check_start_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer("Проверяю подписку...")
+    user = q.from_user
+
+    # Если уже зарегистрирован — просто показываем меню
+    if get_user(user.id):
+        await q.message.reply_text(
+            f"👋 С возвращением, {user.first_name}!\n\nВыбери действие 👇",
+            reply_markup=MAIN_KB,
+        )
+        return
+
+    status_code, data = await _tgrass_get_offers(user)
+    tg_status = data.get("status") if isinstance(data, dict) else None
+    offers    = data.get("offers", []) if isinstance(data, dict) else []
+
+    if status_code == 200 and tg_status == "ok":
+        # Подписался — регистрируем и пускаем в бот
+        referrer_id = ctx.user_data.get("pending_referrer_id")
+        await _finish_start(ctx.bot, user, referrer_id)
+
+    elif status_code == 200 and tg_status == "not_ok" and offers:
+        # Ещё не подписался — показываем обновлённый список
+        await q.message.reply_text(
+            "❌ Вы ещё не подписались на всех партнёров.\n\n"
+            "Подпишитесь и нажмите кнопку снова 👇",
+            reply_markup=_build_offers_kb(offers, callback_data="tgrass_check_start"),
+        )
+
+    elif status_code == 200 and tg_status == "no_offers":
+        # Офферов больше нет — пропускаем
+        referrer_id = ctx.user_data.get("pending_referrer_id")
+        await _finish_start(ctx.bot, user, referrer_id)
+
+    else:
+        # Ошибка tgrass — не блокируем пользователя, пускаем дальше
+        log.warning(f"tgrass ошибка при старте [{user.id}]: {status_code} {data}")
+        referrer_id = ctx.user_data.get("pending_referrer_id")
+        await _finish_start(ctx.bot, user, referrer_id)
 
 
 # ── 💰 Заработать ────────────────────────────────────────────
@@ -224,183 +342,6 @@ async def cabinet_withdraw_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_markup=CANCEL_KB,
     )
     return W_AMOUNT
-
-
-# ── 📋 Задания (tgrass) ──────────────────────────────────────
-
-async def _tgrass_request(user):
-    """Запрос к tgrass API. Возвращает (status_code, data_dict | None)."""
-    payload = {
-        "tg_user_id": int(user.id),
-        "tg_login":   user.username or "",
-        "lang":       getattr(user, "language_code", "ru") or "ru",
-        "is_premium": bool(getattr(user, "is_premium", False)),
-    }
-    headers = {
-        "accept":       "application/json",
-        "Content-Type": "application/json",
-        "Auth":         TGRASS_AUTH,
-    }
-    log.info(f"tgrass request [{user.id}]: {payload}")
-    try:
-        async with httpx.AsyncClient(verify=False, timeout=15.0) as client:
-            resp = await client.post(TGRASS_URL, json=payload, headers=headers)
-        log.info(f"tgrass response [{user.id}]: HTTP {resp.status_code} | {resp.text[:500]}")
-        try:
-            data = resp.json()
-        except Exception:
-            log.warning(f"tgrass: не удалось распарсить JSON: {resp.text[:200]}")
-            data = None
-        return resp.status_code, data
-    except httpx.TimeoutException:
-        log.warning(f"tgrass timeout [{user.id}]")
-        return None, None
-    except Exception as e:
-        log.warning(f"tgrass exception [{user.id}]: {e}")
-        return None, None
-
-
-def _build_offers_kb(offers: list) -> InlineKeyboardMarkup:
-    """Собирает клавиатуру из списка офферов + кнопка проверки."""
-    kb = []
-    for offer in offers:
-        offer_type = offer.get("type", "")
-        btn_text   = "Подписаться" if offer_type == "channel" else "Перейти"
-        link       = offer.get("link") or offer.get("url", "")
-        if link:
-            kb.append([InlineKeyboardButton(text=btn_text, url=link)])
-    kb.append([InlineKeyboardButton(text="✅ Проверить выполнение", callback_data="check_tgrass")])
-    return InlineKeyboardMarkup(kb)
-
-
-async def tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    await update.message.reply_text("⏳ Загружаю задания...")
-
-    status_code, data = await _tgrass_request(user)
-
-    if status_code is None or data is None:
-        await update.message.reply_text(
-            "⚠️ Не удалось загрузить задания. Попробуйте позже."
-        )
-        return
-
-    tg_status = data.get("status") if isinstance(data, dict) else None
-    offers    = data.get("offers", []) if isinstance(data, dict) else []
-
-    # Если появились новые задания — сбрасываем флаг выполнения
-    if tg_status == "not_ok" and offers:
-        u = get_user(user.id)
-        if u and u["tasks_done"]:
-            with _conn() as c:
-                c.execute("UPDATE users SET tasks_done=0 WHERE user_id=?", (user.id,))
-
-    if status_code == 200 and tg_status == "not_ok" and offers:
-        await update.message.reply_text(
-            f"📋 Задания\n\n"
-            f"Выполни все задания и получи {TASK_REWARD}₽ на баланс:",
-            reply_markup=_build_offers_kb(offers),
-        )
-
-    elif status_code == 200 and tg_status == "ok":
-        u = get_user(user.id)
-        if u and u["tasks_done"]:
-            await update.message.reply_text(
-                "✅ Вы уже выполнили все задания и получили награду!\n\n"
-                "Следите за появлением новых заданий."
-            )
-        else:
-            # Статус ok, но награда ещё не начислена — начисляем
-            with _conn() as c:
-                c.execute(
-                    """UPDATE users
-                       SET balance=balance+?, total_earned=total_earned+?, tasks_done=1
-                       WHERE user_id=?""",
-                    (TASK_REWARD, TASK_REWARD, user.id),
-                )
-            u = get_user(user.id)
-            await update.message.reply_text(
-                f"🎉 Задания выполнены!\n\n"
-                f"💰 Начислено: {TASK_REWARD}₽\n"
-                f"💵 Ваш баланс: {u['balance']:.0f}₽"
-            )
-
-    else:
-        await update.message.reply_text(
-            "На данный момент нет доступных заданий.\n"
-            "Загляните позже!"
-        )
-
-
-async def check_tgrass_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer("Проверяю...")
-    user = q.from_user
-
-    # Уже получил награду?
-    u = get_user(user.id)
-    if u and u["tasks_done"]:
-        await q.message.reply_text("✅ Вы уже получили награду за задания!")
-        return
-
-    # Атомарная блокировка: tasks_done = 2 означает "в процессе проверки"
-    # UPDATE сработает только если tasks_done = 0 (не выполнено и не в процессе)
-    with _conn() as c:
-        cur = c.execute(
-            "UPDATE users SET tasks_done=2 WHERE user_id=? AND tasks_done=0",
-            (user.id,),
-        )
-        if cur.rowcount == 0:
-            # Либо уже выполнено (1), либо другой запрос уже проверяет (2)
-            await q.message.reply_text("⏳ Уже проверяется, подождите...")
-            return
-
-    status_code, data = await _tgrass_request(user)
-
-    if status_code is None or data is None:
-        # Снимаем блокировку чтобы можно было попробовать снова
-        with _conn() as c:
-            c.execute("UPDATE users SET tasks_done=0 WHERE user_id=? AND tasks_done=2", (user.id,))
-        await q.message.reply_text("⚠️ Ошибка проверки. Попробуйте позже.")
-        return
-
-    tg_status = data.get("status") if isinstance(data, dict) else None
-    offers    = data.get("offers", []) if isinstance(data, dict) else []
-
-    if status_code == 200 and tg_status == "ok":
-        with _conn() as c:
-            c.execute(
-                """UPDATE users
-                   SET balance=balance+?, total_earned=total_earned+?, tasks_done=1
-                   WHERE user_id=?""",
-                (TASK_REWARD, TASK_REWARD, user.id),
-            )
-        u = get_user(user.id)
-        new_balance = u["balance"] if u else 0
-        await q.message.reply_text(
-            f"🎉 Задание успешно выполнено!\n\n"
-            f"💰 Начислено: {TASK_REWARD}₽\n"
-            f"💵 Ваш баланс: {new_balance:.0f}₽"
-        )
-
-    elif status_code == 200 and tg_status == "not_ok":
-        # Задания не выполнены — снимаем блокировку
-        with _conn() as c:
-            c.execute("UPDATE users SET tasks_done=0 WHERE user_id=? AND tasks_done=2", (user.id,))
-        if offers:
-            await q.message.reply_text(
-                "❌ Не все задания выполнены.\n\n"
-                "Выполните оставшиеся и нажмите «Проверить» снова:",
-                reply_markup=_build_offers_kb(offers),
-            )
-        else:
-            await q.message.reply_text(
-                "❌ Задания ещё не выполнены. Подпишитесь и попробуйте снова."
-            )
-    else:
-        with _conn() as c:
-            c.execute("UPDATE users SET tasks_done=0 WHERE user_id=? AND tasks_done=2", (user.id,))
-        await q.message.reply_text("⚠️ Не удалось проверить задания. Попробуйте позже.")
 
 
 # ── 💳 Вывод средств ─────────────────────────────────────────
@@ -474,7 +415,6 @@ async def withdraw_bank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     details = ctx.user_data.get("w_details", "")
     bank    = text
 
-    # Финальная проверка баланса
     if not u or u["balance"] < amount:
         await update.message.reply_text(
             "❌ Недостаточно средств. Заявка отменена.",
@@ -836,8 +776,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     t = update.message.text
     if t == "💰 Заработать":
         await earn(update, ctx)
-    elif t == "📋 Задания":
-        await tasks(update, ctx)
     elif t == "👤 Кабинет":
         await cabinet(update, ctx)
     elif t == "ℹ️ О боте":
@@ -888,9 +826,10 @@ def main():
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(withdraw_conv)
     app.add_handler(broadcast_conv)
-    app.add_handler(CallbackQueryHandler(adm_withdrawals_cb, pattern=r"^adm_withdrawals$"))
-    app.add_handler(CallbackQueryHandler(approve_reject_cb,  pattern=r"^(appr|rjct)_\d+$"))
-    app.add_handler(CallbackQueryHandler(check_tgrass_cb,    pattern=r"^check_tgrass$"))
+    # Tgrass: проверка подписки при старте
+    app.add_handler(CallbackQueryHandler(tgrass_check_start_cb, pattern=r"^tgrass_check_start$"))
+    app.add_handler(CallbackQueryHandler(adm_withdrawals_cb,    pattern=r"^adm_withdrawals$"))
+    app.add_handler(CallbackQueryHandler(approve_reject_cb,     pattern=r"^(appr|rjct)_\d+$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     log.info("✅ Бот запущен.")

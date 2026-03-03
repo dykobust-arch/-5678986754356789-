@@ -343,9 +343,24 @@ async def check_tgrass_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text("✅ Вы уже получили награду за задания!")
         return
 
+    # Атомарная блокировка: tasks_done = 2 означает "в процессе проверки"
+    # UPDATE сработает только если tasks_done = 0 (не выполнено и не в процессе)
+    with _conn() as c:
+        cur = c.execute(
+            "UPDATE users SET tasks_done=2 WHERE user_id=? AND tasks_done=0",
+            (user.id,),
+        )
+        if cur.rowcount == 0:
+            # Либо уже выполнено (1), либо другой запрос уже проверяет (2)
+            await q.message.reply_text("⏳ Уже проверяется, подождите...")
+            return
+
     status_code, data = await _tgrass_request(user)
 
     if status_code is None or data is None:
+        # Снимаем блокировку чтобы можно было попробовать снова
+        with _conn() as c:
+            c.execute("UPDATE users SET tasks_done=0 WHERE user_id=? AND tasks_done=2", (user.id,))
         await q.message.reply_text("⚠️ Ошибка проверки. Попробуйте позже.")
         return
 
@@ -369,6 +384,9 @@ async def check_tgrass_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
     elif status_code == 200 and tg_status == "not_ok":
+        # Задания не выполнены — снимаем блокировку
+        with _conn() as c:
+            c.execute("UPDATE users SET tasks_done=0 WHERE user_id=? AND tasks_done=2", (user.id,))
         if offers:
             await q.message.reply_text(
                 "❌ Не все задания выполнены.\n\n"
@@ -380,6 +398,8 @@ async def check_tgrass_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 "❌ Задания ещё не выполнены. Подпишитесь и попробуйте снова."
             )
     else:
+        with _conn() as c:
+            c.execute("UPDATE users SET tasks_done=0 WHERE user_id=? AND tasks_done=2", (user.id,))
         await q.message.reply_text("⚠️ Не удалось проверить задания. Попробуйте позже.")
 
 

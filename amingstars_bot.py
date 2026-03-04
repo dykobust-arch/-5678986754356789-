@@ -24,7 +24,7 @@ ADMIN_USERNAME      = "famelonov"
 CHANNEL_LINK        = "https://t.me/REF_GO_PAY"
 REWARD_PER_REFERRAL = 2
 REWARD_PER_TASK     = 3
-MIN_WITHDRAWAL      = 15
+MIN_WITHDRAWAL      = 10
 OFFERS_LIMIT        = 10       # Количество спонсоров за раз
 
 TGRASS_URL       = "https://tgrass.space/offers"
@@ -117,23 +117,39 @@ def register_user(uid, username, full_name, referrer_id=None):
 
 
 def add_task_reward(uid: int, message_id: int) -> bool:
-    with _conn() as c:
-        try:
-            c.execute(
-                "INSERT INTO completed_tasks (user_id, message_id, reward) VALUES (?,?,?)",
-                (uid, message_id, REWARD_PER_TASK),
-            )
-            c.execute(
-                """UPDATE users
-                   SET balance=balance+?,
-                       total_earned=total_earned+?,
-                       tasks_done=tasks_done+1
-                   WHERE user_id=?""",
-                (REWARD_PER_TASK, REWARD_PER_TASK, uid),
-            )
-            return True
-        except sqlite3.IntegrityError:
+    """Начисляет REWARD_PER_TASK. Возвращает False если уже начислено."""
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    try:
+        # Проверяем, не начислялось ли уже по этому message_id
+        existing = conn.execute(
+            "SELECT id FROM completed_tasks WHERE message_id=?", (message_id,)
+        ).fetchone()
+        if existing:
+            log.info(f"add_task_reward: message_id={message_id} already rewarded")
             return False
+
+        conn.execute(
+            "INSERT INTO completed_tasks (user_id, message_id, reward) VALUES (?,?,?)",
+            (uid, message_id, REWARD_PER_TASK),
+        )
+        conn.execute(
+            """UPDATE users
+               SET balance=balance+?,
+                   total_earned=total_earned+?,
+                   tasks_done=tasks_done+1
+               WHERE user_id=?""",
+            (REWARD_PER_TASK, REWARD_PER_TASK, uid),
+        )
+        conn.commit()
+        log.info(f"add_task_reward: uid={uid} rewarded {REWARD_PER_TASK}₽ for msg={message_id}")
+        return True
+    except Exception as e:
+        conn.rollback()
+        log.error(f"add_task_reward error uid={uid}: {e}")
+        return False
+    finally:
+        conn.close()
 
 
 # ── KEYBOARDS ────────────────────────────────────────────────
@@ -287,7 +303,7 @@ async def _tgrass_gate(update: Update, section: str) -> bool:
 async def tgrass_done_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
     Вызывается при нажатии «Проверить подписку».
-    После успеха сбрасывает таймер офферов и открывает нужный раздел.
+    Проверяет статус → начисляет награду → сбрасывает офферы → открывает раздел.
     """
     q = update.callback_query
     await q.answer("🔄 Проверяю подписки...")
@@ -296,11 +312,15 @@ async def tgrass_done_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg_id  = q.message.message_id
     section = q.data.split(":", 1)[1] if ":" in q.data else SECTION_TASKS
 
+    log.info(f"tgrass_done_cb: uid={user.id} msg_id={msg_id} section={section}")
+
     status_code, data = await _tgrass_get_offers(user)
     tg_status = data.get("status") if isinstance(data, dict) else None
     offers    = data.get("offers", []) if isinstance(data, dict) else []
 
-    # ── Не все подписки выполнены ────────────────────────────
+    log.info(f"tgrass_done_cb result: uid={user.id} status_code={status_code} tg_status={tg_status}")
+
+    # ── Ещё не все подписки ──────────────────────────────────
     if status_code == 200 and tg_status == "not_ok" and offers:
         not_done = [o for o in offers if not o.get("subscribed")]
         await q.message.reply_text(
@@ -314,31 +334,42 @@ async def tgrass_done_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML",
             reply_markup=_build_offers_kb(offers, section),
         )
-        return
+        return  # НЕ открываем раздел, ждём выполнения
 
-    # ── Все выполнены (ok / no_offers) ───────────────────────
-    if tg_status == "ok":
+    # ── Все подписки выполнены (ok) ──────────────────────────
+    if status_code == 200 and tg_status == "ok":
         rewarded = add_task_reward(user.id, msg_id)
+
         if rewarded:
+            # Читаем СВЕЖИЙ баланс после начисления
             db_user = get_user(user.id)
             balance = db_user["balance"]    if db_user else 0
             tdone   = db_user["tasks_done"] if db_user else 0
-            await q.message.reply_text(
-                f"🎉 <b>Задания выполнены!</b>\n\n"
-                f"💰 Начислено: <b>+{REWARD_PER_TASK}₽</b>\n"
-                f"💵 Баланс: <b>{balance:.0f}₽</b>\n"
-                f"✅ Серий выполнено: <b>{tdone}</b>",
-                parse_mode="HTML",
-            )
-            # Сбрасываем таймер → при следующем запросе сразу новые офферы
-            await _tgrass_reset(user.id)
-        else:
-            await q.message.reply_text(
-                "⚠️ Награда за эту серию уже была выдана ранее.",
-                parse_mode="HTML",
-            )
 
-    # В любом случае (ok / no_offers / ошибка) открываем нужный раздел
+            await q.message.reply_text(
+                f"🎉 <b>Задание выполнено!</b>\n\n"
+                f"💰 Начислено: <b>+{REWARD_PER_TASK}₽</b>\n"
+                f"💵 Текущий баланс: <b>{balance:.2f}₽</b>\n"
+                f"✅ Серий выполнено: <b>{tdone}</b>\n\n"
+                f"Нажми любую кнопку ниже 👇",
+                parse_mode="HTML",
+                reply_markup=MAIN_KB,
+            )
+            # Сбрасываем таймер ПОСЛЕ отображения награды
+            await _tgrass_reset(user.id)
+            return  # Раздел НЕ открываем автоматически — пусть сам нажмёт
+
+        else:
+            # Уже была получена награда за эту серию
+            await q.message.reply_text(
+                "⚠️ Награда за эту серию уже была выдана ранее.\n\n"
+                "Нажми <b>📋 Задания</b> для новой серии!",
+                parse_mode="HTML",
+                reply_markup=MAIN_KB,
+            )
+            return
+
+    # ── Нет офферов (no_offers) или ошибка — открываем раздел ─
     await _open_section(q.message, user, ctx, section, is_callback=True)
 
 
@@ -415,16 +446,25 @@ async def _show_tasks(update, ctx):
     u          = update.effective_user
     db_user    = get_user(u.id)
     tasks_done = db_user["tasks_done"] if db_user else 0
+    balance    = db_user["balance"]    if db_user else 0
 
-    # Показываем актуальный список офферов как «задания»
+    # Запрашиваем актуальный список офферов
     status_code, data = await _tgrass_get_offers(u)
     tg_status = data.get("status") if isinstance(data, dict) else None
     offers    = data.get("offers", []) if isinstance(data, dict) else []
 
-    if tg_status == "no_offers" or tg_status == "ok":
+    if status_code is None:
         await update.message.reply_text(
-            f"✅ <b>Все текущие задания выполнены!</b>\n\n"
-            f"Серий выполнено: <b>{tasks_done}</b>\n"
+            "❌ Ошибка соединения. Попробуй позже.",
+            reply_markup=MAIN_KB,
+        )
+        return
+
+    if tg_status in ("ok", "no_offers"):
+        await update.message.reply_text(
+            f"✅ <b>Все задания выполнены!</b>\n\n"
+            f"💵 Баланс: <b>{balance:.2f}₽</b>\n"
+            f"✅ Серий выполнено: <b>{tasks_done}</b>\n\n"
             f"Новые задания появятся позже 🔄",
             parse_mode="HTML",
             reply_markup=MAIN_KB,
@@ -437,7 +477,7 @@ async def _show_tasks(update, ctx):
         )
     else:
         await update.message.reply_text(
-            f"✅ <b>Все задания выполнены!</b>\n\nСерий выполнено: <b>{tasks_done}</b>",
+            f"✅ Серий выполнено: <b>{tasks_done}</b> | 💵 Баланс: <b>{balance:.2f}₽</b>",
             parse_mode="HTML",
             reply_markup=MAIN_KB,
         )
@@ -487,8 +527,8 @@ async def _show_cabinet(update, ctx):
 
     await update.message.reply_text(
         f"👤 <b>Личный кабинет</b>\n\n"
-        f"💵 Баланс: <b>{balance:.0f}₽</b>\n"
-        f"💸 Всего заработано: <b>{earned:.0f}₽</b>\n"
+        f"💵 Баланс: <b>{balance:.2f}₽</b>\n"
+        f"💸 Всего заработано: <b>{earned:.2f}₽</b>\n"
         f"👥 Рефералов: <b>{ref_count}</b>\n"
         f"✅ Заданий выполнено: <b>{tasks_done}</b>",
         parse_mode="HTML",
@@ -528,33 +568,23 @@ async def _show_about(update, ctx):
 # ── ОБРАБОТЧИКИ КНОПОК МЕНЮ (с gate) ─────────────────────────
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """
-    При нажатии любой кнопки:
-    1. Проверяем Tgrass gate
-    2. Если есть незавершённые офферы — показываем их (gate возвращает False)
-    3. Если всё ок — открываем нужный раздел
-    """
     t = update.message.text
 
-    section_map = {
-        "📋 Задания":      SECTION_TASKS,
-        "💰 Заработать":   SECTION_EARN,
-        "👤 Кабинет":      SECTION_CABINET,
-        "ℹ️ О боте":       SECTION_ABOUT,
-    }
+    if t == "📋 Задания":
+        # Только для раздела «Задания» проверяем gate Tgrass
+        passed = await _tgrass_gate(update, SECTION_TASKS)
+        if not passed:
+            return
+        await _open_section(update.message, update.effective_user, ctx, SECTION_TASKS)
 
-    if t not in section_map:
-        return
+    elif t == "💰 Заработать":
+        await _show_earn(update, ctx)
 
-    section = section_map[t]
+    elif t == "👤 Кабинет":
+        await _show_cabinet(update, ctx)
 
-    # Проверяем gate. Если False — офферы уже отправлены, ждём выполнения
-    passed = await _tgrass_gate(update, section)
-    if not passed:
-        return
-
-    # Gate пройден — открываем раздел
-    await _open_section(update.message, update.effective_user, ctx, section)
+    elif t == "ℹ️ О боте":
+        await _show_about(update, ctx)
 
 
 # ── 👤 Вывод средств ─────────────────────────────────────────
